@@ -1,0 +1,118 @@
+name: build-wireshark
+
+# Builds the wireshark image from the latest stable Wireshark release and pushes
+# it to GHCR, and to Docker Hub when the DOCKERHUB_USERNAME / DOCKERHUB_TOKEN
+# repo secrets are set. Runs weekly; only builds when that release has no image yet.
+on:
+  schedule:
+    - cron: "0 6 * * 1" # weekly (Mondays 06:00 UTC) check for a new Wireshark release
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Tag to publish (e.g. 4.6.6). Empty = latest stable from the PPA (what the image installs)."
+        required: false
+        default: ""
+  push:
+    branches: [master]
+    paths:
+      - "wireshark/**"
+      - ".github/workflows/wireshark.yml"
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/wireshark
+  # Run JS actions on Node 24 now (the forced default from 2026-06-16),
+  # clearing the "Node.js 20 actions are deprecated" annotation.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # Optional Docker Hub mirror. Leave the secret unset to push to GHCR only.
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve Wireshark version
+        id: ver
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          version="$INPUT_VERSION"
+          if [[ -z "$version" ]]; then
+            # noble = the suite of the ubuntu-24.04 base in wireshark.dockerfile.
+            version=$(curl -fsSL "https://ppa.launchpadcontent.net/wireshark-dev/stable/ubuntu/dists/noble/main/binary-amd64/Packages.gz" \
+              | gunzip \
+              | awk '/^Package: wireshark$/{p=1} p&&/^Version:/{v=$2; sub(/-.*/,"",v); print v; exit}')
+          fi
+          version=${version#v}
+          [[ -n "$version" ]] || { echo "could not resolve Wireshark version from the PPA" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "target Wireshark version: $version"
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # On the weekly schedule, skip when the latest version is already built.
+      # On push (Dockerfile change) or manual dispatch, always (re)build.
+      - name: Decide whether to build
+        id: exists
+        env:
+          REF: ${{ env.IMAGE }}:${{ steps.ver.outputs.version }}
+        run: |
+          if [[ "${{ github.event_name }}" == "schedule" ]] && docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "$REF already exists - nothing to do."
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to Docker Hub
+        if: steps.exists.outputs.build == 'true' && env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # GHCR always; Docker Hub too when DOCKERHUB_USERNAME is set.
+      - name: Compose image tags
+        id: tags
+        if: steps.exists.outputs.build == 'true'
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          {
+            echo "tags<<EOF"
+            echo "$IMAGE:$VERSION"
+            echo "$IMAGE:latest"
+            if [[ -n "$DOCKERHUB_USERNAME" ]]; then
+              echo "docker.io/$DOCKERHUB_USERNAME/wireshark:$VERSION"
+              echo "docker.io/$DOCKERHUB_USERNAME/wireshark:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        if: steps.exists.outputs.build == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        if: steps.exists.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        if: steps.exists.outputs.build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: wireshark
+          file: wireshark/wireshark.dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
