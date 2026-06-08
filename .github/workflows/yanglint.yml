@@ -5,7 +5,7 @@ name: build-yanglint
 # secrets are set. Runs weekly; only builds when that version has no image yet.
 on:
   schedule:
-    - cron: "0 6 * * 1" # weekly (Mondays 06:00 UTC) check for a new libyang release
+    - cron: "23 6 * * 1" # weekly (Mondays 06:23 UTC) check for a new libyang release; off the congested :00 slot
   workflow_dispatch:
     inputs:
       version:
