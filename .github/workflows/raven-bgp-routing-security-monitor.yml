@@ -1,0 +1,133 @@
+name: build-raven-bgp-routing-security-monitor
+
+# Builds the raven (Nokia bgp-routing-security-monitor) image and pushes it to
+# GHCR, and to Docker Hub when the DOCKERHUB_USERNAME / DOCKERHUB_TOKEN repo
+# secrets are set. Two legs run in parallel:
+#   - latest : the tip of upstream `main`  -> :latest and :<short-commit>
+#   - release: the highest semver tag      -> :<version> (e.g. 0.3.2)
+# Runs weekly; the latest leg rebuilds only when main has advanced, the release
+# leg only when a new tag has no image yet.
+on:
+  schedule:
+    - cron: "23 6 * * 1" # weekly (Mondays 06:23 UTC); off the congested :00 slot
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - "raven-bgp-routing-security-monitor/**"
+      - ".github/workflows/raven-bgp-routing-security-monitor.yml"
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/raven-bgp-routing-security-monitor
+  UPSTREAM: https://github.com/nokia/bgp-routing-security-monitor.git
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        kind: [latest, release]
+    env:
+      # Optional Docker Hub mirror. Leave the secret unset to push to GHCR only.
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # Resolve the git ref to build and the tag values for this leg:
+      #   latest  -> ref=main,   primary=<short-commit>, moving=latest
+      #   release -> ref=v<X>,   primary=<X> (no leading v), moving=(none)
+      - name: Resolve build target
+        id: t
+        env:
+          KIND: ${{ matrix.kind }}
+        run: |
+          if [[ "$KIND" == "latest" ]]; then
+            sha=$(git ls-remote "$UPSTREAM" main | awk '{print $1}')
+            [[ -n "$sha" ]] || { echo "could not resolve main commit" >&2; exit 1; }
+            ref="main"
+            primary="${sha:0:7}"
+            moving="latest"
+          else
+            tag=$(git ls-remote --tags --refs --sort='v:refname' "$UPSTREAM" | awk -F/ 'END{print $NF}')
+            [[ -n "$tag" ]] || { echo "could not resolve latest release tag" >&2; exit 1; }
+            ref="$tag"
+            primary="${tag#v}"
+            moving=""
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "primary=$primary" >> "$GITHUB_OUTPUT"
+          echo "moving=$moving" >> "$GITHUB_OUTPUT"
+          echo "target $KIND: ref=$ref primary=$primary moving=${moving:-none}"
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # On the weekly schedule, skip when the primary tag already exists (main
+      # unchanged, or that release already built). On push or dispatch, always
+      # (re)build.
+      - name: Decide whether to build
+        id: exists
+        env:
+          REF: ${{ env.IMAGE }}:${{ steps.t.outputs.primary }}
+        run: |
+          if [[ "${{ github.event_name }}" == "schedule" ]] && docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "$REF already exists - nothing to do."
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to Docker Hub
+        if: steps.exists.outputs.build == 'true' && env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # GHCR always; Docker Hub too when DOCKERHUB_USERNAME is set.
+      - name: Compose image tags
+        id: tags
+        if: steps.exists.outputs.build == 'true'
+        env:
+          PRIMARY: ${{ steps.t.outputs.primary }}
+          MOVING: ${{ steps.t.outputs.moving }}
+        run: |
+          repo="raven-bgp-routing-security-monitor"
+          {
+            echo "tags<<EOF"
+            echo "$IMAGE:$PRIMARY"
+            if [[ -n "$MOVING" ]]; then echo "$IMAGE:$MOVING"; fi
+            if [[ -n "$DOCKERHUB_USERNAME" ]]; then
+              echo "docker.io/$DOCKERHUB_USERNAME/$repo:$PRIMARY"
+              if [[ -n "$MOVING" ]]; then echo "docker.io/$DOCKERHUB_USERNAME/$repo:$MOVING"; fi
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        if: steps.exists.outputs.build == 'true'
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Buildx
+        if: steps.exists.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        if: steps.exists.outputs.build == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: raven-bgp-routing-security-monitor
+          file: raven-bgp-routing-security-monitor/raven-bgp-routing-security-monitor.dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            REF=${{ steps.t.outputs.ref }}
+          tags: ${{ steps.tags.outputs.tags }}
